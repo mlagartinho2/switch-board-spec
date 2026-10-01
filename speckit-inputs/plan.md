@@ -1,12 +1,12 @@
-# Implementation plan: Switchboard — Spring Boot 3.x library
+# Implementation plan: Switchboard — Spring Boot 4.x library
 
-Paste this as the argument to `/speckit.plan` for the `switchboard-spring-boot3` repo, after `/speckit.specify` has run.
+Paste this as the argument to `/speckit.plan`, after `/speckit.specify` has run.
 
 ## Stack
 
-- Java 17+, Spring Boot 3.x, `jakarta.servlet.*`
-- Single self-contained artifact — no internal split into core/autoconfigure/starter submodules
-- Artifact: `com.yourorg:switchboard-spring-boot3`
+- Java 17+, Spring Boot 4.x, Spring Framework 7, Jakarta EE 11 / Servlet 6.1
+- Two modules, one release: `switchboard-autoconfigure` (all code) + `switchboard-spring-boot-starter` (dependency-only)
+- Artifacts: `com.yourorg:switchboard-autoconfigure`, `com.yourorg:switchboard-spring-boot-starter`
 
 ## Design patterns
 
@@ -22,20 +22,24 @@ Considered and set aside: a rules engine (Drools or similar) for resolution — 
 ## Module layout
 
 ```
-switchboard-spring-boot3
-├── SwitchboardStrategy<Req, Res>                      (interface)
-├── SwitchboardContext                                 (resolved metadata: matched key, correlation id)
-├── @SwitchboardCase                                        (annotation for self-registration)
+switchboard-autoconfigure
+├── SwitchboardStrategy<Req, Res>                  (interface)
+├── SwitchboardContext                             (resolved metadata: matched key, correlation id)
+├── @SwitchboardCase                                (annotation for self-registration)
 ├── SwitchboardRegistry
 ├── SwitchboardResolver / HeaderResolver / PayloadFieldResolver / RouteResolver
 ├── SwitchboardResolverChain
 ├── SwitchboardDispatcher
 ├── SwitchboardAutoConfiguration
-├── SwitchboardProperties                              (@ConfigurationProperties(prefix = "switchboard"))
+├── SwitchboardProperties                          (@ConfigurationProperties(prefix = "switchboard"))
 ├── SwitchboardUnresolvedException / SwitchboardNotAvailableException
-├── SwitchboardExceptionHandler                         (@RestControllerAdvice)
-├── SwitchboardEndpoint                                (actuator endpoint)
-└── src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+├── SwitchboardExceptionHandler                     (@RestControllerAdvice)
+├── SwitchboardEndpoint                             (actuator endpoint)
+└── META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+
+switchboard-spring-boot-starter
+├── depends on: switchboard-autoconfigure
+└── depends on: spring-boot-starter-webmvc
 ```
 
 ## Core interface
@@ -76,8 +80,16 @@ public class SwitchboardRegistry {
     private final Map<String, SwitchboardStrategy<?, ?>> strategies;
 
     public SwitchboardRegistry(List<SwitchboardStrategy<?, ?>> beans) {
-        this.strategies = beans.stream()
-            .collect(Collectors.toMap(SwitchboardStrategy::caseKey, Function.identity()));
+        Objects.requireNonNull(beans, "beans must not be null");
+        this.strategies = Map.copyOf(beans.stream()
+            .collect(Collectors.toMap(
+                SwitchboardStrategy::caseKey,
+                Function.identity(),
+                (first, second) -> {
+                    throw new IllegalStateException(
+                        "Duplicate Switchboard case key '" + first.caseKey() + "' registered by both "
+                        + first.getClass().getName() + " and " + second.getClass().getName());
+                })));
     }
 
     public Optional<SwitchboardStrategy<?, ?>> find(String key) {
@@ -85,6 +97,8 @@ public class SwitchboardRegistry {
     }
 }
 ```
+
+The explicit merge function (Item 49: fail fast with a message that names the actual conflict) replaces `Collectors.toMap`'s default behavior, which would otherwise silently keep whichever strategy happened to be processed last. Wrapping the result in `Map.copyOf` (Item 17: minimize mutability) means the registry can never be mutated after construction, even accidentally from within this class.
 
 ## Resolver chain
 
@@ -104,7 +118,6 @@ public class HeaderResolver implements SwitchboardResolver {
 @Component
 @Order(2)
 public class PayloadFieldResolver implements SwitchboardResolver {
-    // Java 17+ target — instanceof pattern matching available
     public Optional<String> resolve(HttpServletRequest req, Object payload) {
         if (payload instanceof SwitchboardDiscriminated d) return Optional.ofNullable(d.getSwitchboardCase());
         return Optional.empty();
@@ -122,6 +135,11 @@ public class RouteResolver implements SwitchboardResolver {
 @Component
 public class SwitchboardResolverChain {
     private final List<SwitchboardResolver> resolvers; // ordered per config, see below
+
+    public SwitchboardResolverChain(List<SwitchboardResolver> resolvers) {
+        Objects.requireNonNull(resolvers, "resolvers must not be null");
+        this.resolvers = List.copyOf(resolvers); // defensive copy (Item 50) + immutable (Item 17)
+    }
 
     public String resolve(HttpServletRequest req, Object payload) {
         return resolvers.stream()
@@ -142,8 +160,18 @@ public class SwitchboardDispatcher {
     private final SwitchboardResolverChain resolver;
     private final SwitchboardRegistry registry;
 
+    public SwitchboardDispatcher(SwitchboardResolverChain resolver, SwitchboardRegistry registry) {
+        this.resolver = Objects.requireNonNull(resolver, "resolver must not be null");
+        this.registry = Objects.requireNonNull(registry, "registry must not be null");
+    }
+
     public <Req, Res> Res dispatch(HttpServletRequest httpRequest, Req request) {
         String key = resolver.resolve(httpRequest, request);
+        // Unchecked cast is unavoidable: the registry is keyed by runtime strings (caseKey()),
+        // so the compiler cannot verify Req/Res line up with the resolved strategy. Safe because
+        // caseKey() uniquely identifies one strategy type per key by construction (Item 27: scope
+        // the suppression to this one declaration, not the whole method).
+        @SuppressWarnings("unchecked")
         SwitchboardStrategy<Req, Res> strategy = (SwitchboardStrategy<Req, Res>) registry.find(key)
             .orElseThrow(() -> new SwitchboardNotAvailableException(key));
         return strategy.execute(request, new SwitchboardContext(key));
@@ -187,7 +215,7 @@ public class SwitchboardAutoConfiguration {
 }
 ```
 
-Registration file (Boot 3 uses the current mechanism):
+Registration file:
 
 ```
 # src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
@@ -215,10 +243,16 @@ switchboard:
 ```java
 public class SwitchboardUnresolvedException extends RuntimeException {
     public SwitchboardUnresolvedException(String uri) { super("No resolver matched a use case for: " + uri); }
+    public SwitchboardUnresolvedException(String uri, Throwable cause) {
+        super("No resolver matched a use case for: " + uri, cause); // Item 73: preserve the original cause
+    }
 }
 
 public class SwitchboardNotAvailableException extends RuntimeException {
     public SwitchboardNotAvailableException(String key) { super("Use case '" + key + "' is not registered or is disabled"); }
+    public SwitchboardNotAvailableException(String key, Throwable cause) {
+        super("Use case '" + key + "' is not registered or is disabled", cause);
+    }
 }
 
 @RestControllerAdvice
@@ -245,8 +279,8 @@ public class SwitchboardEndpoint {
     private final SwitchboardProperties properties;
 
     public SwitchboardEndpoint(SwitchboardRegistry registry, SwitchboardProperties properties) {
-        this.registry = registry;
-        this.properties = properties;
+        this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.properties = Objects.requireNonNull(properties, "properties must not be null");
     }
 
     @ReadOperation
@@ -327,9 +361,9 @@ sequenceDiagram
 - Unit test `SwitchboardResolverChain` precedence given different config orders.
 - Unit test `SwitchboardRegistry` and `SwitchboardDispatcher` with mock strategies.
 - `ApplicationContextRunner`-based test verifying auto-configuration activates, backs off when `switchboard.enabled=false`, and respects `@ConditionalOnMissingBean`.
-- A minimal sample Spring Boot 3.x application with one real strategy, exercised end-to-end (integration test hitting a real controller).
+- A minimal sample Spring Boot 4.x application with one real strategy, exercised end-to-end (integration test hitting a real controller).
 
 ## Publishing
 
-- Artifact: `com.yourorg:switchboard-spring-boot3`, Nexus `maven-releases` repository.
-- Independent semantic versioning line for this library only (see constitution.md).
+- Artifacts: `com.yourorg:switchboard-autoconfigure`, `com.yourorg:switchboard-spring-boot-starter`, Nexus `maven-releases` repository, released together at the same version.
+- Fresh version line starting at 2.0.0 — not a continuation of the retired Boot 2/3 line.

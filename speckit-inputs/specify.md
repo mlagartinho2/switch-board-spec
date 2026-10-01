@@ -1,10 +1,10 @@
-# Feature: Switchboard — Spring Boot 3.x library
+# Feature: Switchboard — Spring Boot 4.x library
 
-Paste this as the argument to `/speckit.specify` for the `switchboard-spring-boot3` repo.
+Paste this as the argument to `/speckit.specify` for the `switchboard` repo.
 
 ## Problem
 
-Multiple use cases in a consuming application share the same API request/response contract, but each needs different business logic executed. Consuming teams currently handle this with growing `if/else`/`switch` blocks per endpoint. We want a reusable library that any Spring Boot 3.x application can add as a dependency to solve this cleanly, without writing that dispatch logic themselves.
+Multiple use cases in a consuming application share the same API request/response contract, but each needs different business logic executed. Consuming teams currently handle this with growing `if/else`/`switch` blocks per endpoint. We want a reusable library that a Spring Boot 4.x application can add as a dependency to solve this cleanly, without writing that dispatch logic themselves.
 
 ## What the library must do
 
@@ -24,7 +24,7 @@ Multiple use cases in a consuming application share the same API request/respons
 
 ## Target environment
 
-- Spring Boot 3.x
+- Spring Boot 4.x only — no Spring Boot 2.x or 3.x support, by deliberate decision
 - Java 17 or later
 - Consumed as a Maven/Gradle dependency published to an internal Nexus/Artifactory repository
 - No runtime (no-restart) reconfiguration required — configuration changes are applied via redeploy/restart
@@ -33,4 +33,4 @@ Multiple use cases in a consuming application share the same API request/respons
 
 - Any business logic itself — that lives entirely in the consuming application.
 - The HTTP controller/endpoint definition — that also lives in the consuming application; the library provides the dispatch mechanism the controller delegates to.
-- Compatibility with Spring Boot 2.x — that is a separate, independent library with its own spec.
+- Compatibility with Spring Boot 2.x or 3.x — not supported, not planned.
